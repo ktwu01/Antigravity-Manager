@@ -187,6 +187,8 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
 
             if (Array.isArray(history)) {
                 setLogs(history);
+                // Clear pending logs to avoid duplicates (database data is authoritative)
+                pendingLogsRef.current = [];
             }
 
             const currentStats = await Promise.race([
@@ -231,16 +233,28 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     };
 
     const pendingLogsRef = useRef<ProxyRequestLog[]>([]);
+    const listenerSetupRef = useRef(false);
+    const isMountedRef = useRef(true);
 
     useEffect(() => {
+        isMountedRef.current = true;
         loadData();
+        
         let unlistenFn: (() => void) | null = null;
         let updateTimeout: number | null = null;
 
         const setupListener = async () => {
+            // Prevent duplicate listener registration (React 18 StrictMode)
+            if (listenerSetupRef.current) {
+                console.debug('[ProxyMonitor] Listener already set up, skipping...');
+                return;
+            }
+            listenerSetupRef.current = true;
+            
             console.debug('[ProxyMonitor] Setting up event listener for proxy://request');
             unlistenFn = await listen<ProxyRequestLog>('proxy://request', (event) => {
-                // console.debug('[ProxyMonitor] Received event:', event);
+                if (!isMountedRef.current) return;
+                
                 const newLog = event.payload;
 
                 // 移除 body 以减少内存占用
@@ -250,12 +264,20 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                     response_body: undefined
                 };
 
-                // 添加到待处理队列 (Use Ref to avoid closure staleness)
+                // Check if this log already exists (deduplicate at event level)
+                const alreadyExists = pendingLogsRef.current.some(log => log.id === newLog.id);
+                if (alreadyExists) {
+                    console.debug('[ProxyMonitor] Duplicate event ignored:', newLog.id);
+                    return;
+                }
+
                 pendingLogsRef.current.push(logSummary);
 
                 // 防抖:每 500ms 批量更新一次
                 if (updateTimeout) clearTimeout(updateTimeout);
-                updateTimeout = setTimeout(() => {
+                updateTimeout = setTimeout(async () => {
+                    if (!isMountedRef.current) return;
+                    
                     const currentPending = pendingLogsRef.current;
                     if (currentPending.length > 0) {
                         setLogs(prev => {
@@ -268,15 +290,15 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                             return merged.slice(0, 100);
                         });
 
-                        // 批量更新统计
-                        setStats((prev: ProxyStats) => {
-                            const successCount = currentPending.filter(log => log.status >= 200 && log.status < 400).length;
-                            return {
-                                total_requests: prev.total_requests + currentPending.length,
-                                success_count: prev.success_count + successCount,
-                                error_count: prev.error_count + (currentPending.length - successCount),
-                            };
-                        });
+                        // Fetch stats from backend instead of local calculation
+                        try {
+                            const currentStats = await invoke<ProxyStats>('get_proxy_stats');
+                            if (currentStats && isMountedRef.current) {
+                                setStats(currentStats);
+                            }
+                        } catch (e) {
+                            console.error('Failed to fetch stats:', e);
+                        }
 
                         pendingLogsRef.current = [];
                     }
@@ -284,7 +306,10 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             });
         };
         setupListener();
+        
         return () => {
+            isMountedRef.current = false;
+            listenerSetupRef.current = false;
             if (unlistenFn) unlistenFn();
             if (updateTimeout) clearTimeout(updateTimeout);
         };
